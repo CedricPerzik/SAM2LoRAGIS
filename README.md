@@ -13,18 +13,18 @@ that aren't exposed as flags (the Hydra YAML config).
 
 ```bash
 # Requires EduVPN (Institute Access profile, https://ut.eduvpn.nl/portal/home)
-ssh s2145588@hpc-head1.ewi.utwente.nl
+ssh s1234567@hpc-head1.ewi.utwente.nl
 ```
 
 | Resource | Cluster path |
 |---|---|
-| Code (model repo) | `/home/s2145588/thesis/sam2loraboracluster/` |
-| Data (PNG cache) | `/home/s2145588/thesis/data/favela_png/` |
-| SLURM job logs | `/home/s2145588/thesis/sam2loraboracluster/logs/` |
-| TensorBoard logs | `/home/s2145588/thesis/sam2loraboracluster/sam2/sam2_logs/<RUN_ID>/n<N>/` |
-| Test-split manifests | `/home/s2145588/thesis/data/test_split/<RUN_ID>/test_tiles.json` |
-| Predictions | `/home/s2145588/thesis/data/predictions/<RUN_ID>/n<N>/<area>/` |
-| IoU results (CSV) | `/home/s2145588/thesis/data/iou_results/<RUN_ID>/n<N>/n<N>_<area>_unified_metrics.csv` |
+| Code (model repo) | `/home/s1234567/thesis/sam2loraboracluster/` |
+| Data (PNG cache) | `/home/s1234567/thesis/data/favela_png/` |
+| SLURM job logs | `/home/s1234567/thesis/sam2loraboracluster/logs/` |
+| TensorBoard logs | `/home/s1234567/thesis/sam2loraboracluster/sam2/sam2_logs/<RUN_ID>/n<N>/` |
+| Test-split manifests | `/home/s1234567/thesis/data/test_split/<RUN_ID>/test_tiles.json` |
+| Predictions | `/home/s1234567/thesis/data/predictions/<RUN_ID>/n<N>/<area>/` |
+| IoU results (CSV) | `/home/s1234567/thesis/data/iou_results/<RUN_ID>/n<N>/n<N>_<area>_unified_metrics.csv` |
 | Conda env | `sam2lora` |
 
 ## Where to change values
@@ -82,7 +82,7 @@ Downloads the four pretrained SAM2.1 checkpoints (`tiny`, `small`, `base_plus`,
 LoRA config loads by default. No settings to tune — just run it once:
 
 ```bash
-cd /home/s2145588/thesis/sam2loraboracluster/sam2/checkpoints
+cd /home/s1234567/thesis/sam2loraboracluster/sam2/checkpoints
 bash download_ckpts.sh
 ```
 
@@ -335,7 +335,7 @@ bash cleanup_hp_checkpoints.sh --dry    # show what would be deleted only
 ## Monitoring
 
 ```bash
-squeue -u s2145588           # running / queued jobs
+squeue -u s1234567           # running / queued jobs
 seff <jobid>                 # efficiency report after completion
 # Web dashboard: http://hpc-status.ewi.utwente.nl/slurm/
 ```
@@ -343,9 +343,9 @@ seff <jobid>                 # efficiency report after completion
 TensorBoard (SSH tunnel from local machine):
 
 ```bash
-ssh -L 6006:localhost:6006 s2145588@hpc-head1.ewi.utwente.nl
+ssh -L 6006:localhost:6006 s1234567@hpc-head1.ewi.utwente.nl
 # on the cluster:
-tensorboard --logdir /home/s2145588/thesis/sam2loraboracluster/sam2/sam2_logs/ --port 6006
+tensorboard --logdir /home/s1234567/thesis/sam2loraboracluster/sam2/sam2_logs/ --port 6006
 ```
 
 ---
@@ -354,11 +354,11 @@ tensorboard --logdir /home/s2145588/thesis/sam2loraboracluster/sam2/sam2_logs/ -
 
 ```bash
 # 1. One-time setup
-cd /home/s2145588/thesis/sam2loraboracluster/sam2/checkpoints && bash download_ckpts.sh
-cd /home/s2145588/thesis/sam2loraboracluster/sam2 && pip install -e .
+cd /home/s1234567/thesis/sam2loraboracluster/sam2/checkpoints && bash download_ckpts.sh
+cd /home/s1234567/thesis/sam2loraboracluster/sam2 && pip install -e .
 
 # 2. Train — submits 35 jobs (5 seeds x 7 sizes), creates run_001..run_005
-cd /home/s2145588/thesis
+cd /home/s1234567/thesis
 bash submit_scarcity_sweep.sh --seeds 1 26 42 99 1234
 
 # (wait for squeue to clear)
