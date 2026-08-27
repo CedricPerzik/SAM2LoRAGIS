@@ -98,10 +98,6 @@ Modified upstream files:
 | `training/trainer.py` | LoRA-aware trainer, early stopping, the `_LOSS_KEY_MAP` fix (see CLAUDE.md) |
 | `training/utils/logger.py` | ASCII-safe logging (SLURM nodes run a latin-1 locale) |
 
-Deleted (safe to remove — superseded by `sam2/configs/sam2/*.yaml`, not
-required for anything in this pipeline):
-`sam2/sam2_hiera_b+.yaml`, `sam2/sam2_hiera_l.yaml`, `sam2/sam2_hiera_s.yaml`,
-`sam2/sam2_hiera_t.yaml`.
 
 New files/directories added by this project:
 

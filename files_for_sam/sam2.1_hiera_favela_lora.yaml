@@ -1,0 +1,477 @@
+# @package _global_
+#
+# SAM2.1 LoRA fine-tuning on favela rooftop segmentation — unified config.
+#
+# Model size is selected at launch time via --model-size t|s|b+|l.
+# The YAML defaults to b+; train.py patches trunk/neck/checkpoint for other sizes.
+#
+# Architecture per size:
+#   Size  embed_dim  stages           global_att_blocks  backbone_channel_list        Params
+#   t        96    [1,2,7,2]  (12)    [5,7,9]            [768,384,192,96]             ~38 M
+#   s        96    [1,2,11,2] (16)    [7,10,13]          [768,384,192,96]             ~46 M
+#   b+      112    [2,3,16,3] (24)    [12,16,20]         [896,448,224,112]            ~81 M
+#   l       144    [2,6,36,4] (48)    [23,33,43]         [1152,576,288,144]          ~224 M ← default
+#
+# Tier 1 improvements applied (2026-05-19):
+#   - LoRA rank 4 → 16, alpha 32.0 (alpha=2×rank per SOURCE_1 §H4.7)
+#   - BCE loss weight 1.0 → 0.0 (proven dead: flat at 0.029 every epoch)
+#   - PNG cache mode: reliable 8-bit RGB tiles + per-instance mask PNGs
+#   - Dataset-specific normalisation (computed from 597 training tiles):
+#       mean=[0.5642, 0.5737, 0.5248], std=[0.3336, 0.3153, 0.3347]
+#     vs ImageNet: mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+# Tier 2 improvements applied (2026-05-19):
+#   - RandomAffine degrees 90 → 45: reduces zero-area mask events while
+#     retaining rotation diversity appropriate for nadir drone views
+#   - num_correction_pt_per_frame 3 → 6: richer iterative boundary-refining
+#     supervision for complex irregular rooftop shapes
+#   - prob_to_sample_from_gt_for_train 0.1 → 0.3: more GT-sampled correction
+#     clicks reduce noisy gradient signal from early prediction errors
+#   - train_batch_size 2 → 4, num_workers 2 → 4: PNG loading allows larger
+#     batches without RAM pressure; stabilises LoRA gradient estimates
+# Tier 3 improvements applied (2026-05-19):
+#   - LoRA extended to Hiera FFN + MaskDecoder FFN (Attn+MLP r=16 = 3.07M params, 3.8%)
+#   - 75/25 train/val split on ID regions (seed=42, tile-level, reproducible)
+#     -> enables in-distribution validation loss tracking during training
+#   - Trainer mode changed train_only → train to enable val loop
+# Tier 6 change (2026-08-12):
+#   - Split changed 75/25 (train/val) -> 50/25/25 (train/val/test). The extra
+#     test slice holds out a small in-distribution partition (from ceu_paz +
+#     cantidio_sampaio) that is never seen during training or the per-epoch
+#     val loop, for comparison against the OOD santa_madalena eval.
+#   - See scratch.train_fraction / scratch.test_fraction below and
+#     training/dataset/split_utils.py:dump_test_manifest(), called from
+#     train.py's main() via --test-split-dir, which writes the held-out
+#     test tile names to a manifest for later inference.
+# Tier 4 improvements applied (2026-05-19):
+#   - base_lr 1e-4 → 2e-4: 3× more LoRA params need larger step size; 2× is
+#     conservative given scaling=2.0 already amplifies effective updates
+#   - tversky_beta 0.7 → 0.8: tighter recall bias (FN/FP penalty ratio 2.67× vs 2.33×)
+#   - T4.3 (zero WD on lora_B) SKIPPED: per-step shrinkage at lr=2e-4 is only
+#     ~2e-6; total effect over 50 epochs is <4% — not worth the added complexity
+#
+# Tier 5 improvements applied (2026-05-22):
+#   - early_stop_patience 10 → 5, early_stop_start_epoch 25 → 5,
+#     checkpoint_save_start_epoch 20 → 5: l_r8_v1 overfitted before any _best
+#     checkpoint could save (best was epoch 13, saves only started at epoch 20);
+#     now model warms up for 5 epochs then starts saving/monitoring immediately.
+#   - LR schedule: pure cosine → linear warmup (10% of training) + cosine.
+#     Warmup prevents large early gradient steps from destabilising the low-rank
+#     subspace before it has formed; cosine end value tightened base_lr/10 →
+#     base_lr/20 for faster final-stage decay on the small favela dataset.
+#
+# Launch examples:
+#   b+ model, GPU 0:
+#     python training/train.py -c configs/sam2.1_training/sam2.1_hiera_favela_lora \
+#       --num-gpus 1 --model-size b+ --run-name b+_rank16_v1
+#
+#   Large model (default), GPU 0:
+#     python training/train.py -c configs/sam2.1_training/sam2.1_hiera_favela_lora \
+#       --num-gpus 1 --model-size l --run-name l_rank16_v1
+#
+#   Tiny model, GPU 1:
+#     python training/train.py -c configs/sam2.1_training/sam2.1_hiera_favela_lora \
+#       --num-gpus 1 --model-size t --gpu-ids 1 --run-name t_rank16_v1
+#
+# The trainer:
+#   1. Builds SAM2TrainLoRA (injects LoRA into attn + MLP, freezes base weights)
+#   2. Loads the size-appropriate SAM2.1 checkpoint
+#      (LoRA A/B are missing → ignored via ignore_missing_keys)
+#   3. Trains only the LoRA A/B matrices
+
+scratch:
+  model_size: l              # default; overridden at runtime by --model-size flag
+  resolution: 1024
+  train_batch_size: 4          # 8 is also VRAM-viable (24GB card uses ~5GB at bs=2)
+  num_train_workers: 4         # PNG loading is light; 4 workers safe without OOM
+  num_frames: 1                # static images treated as 1-frame videos
+  max_num_objects: 1           # one rooftop instance per sample
+  base_lr: 7.102526614544882e-05  # Optuna best (trial #20, val_dice=0.9839)
+  vision_lr: 7.102526614544882e-05
+  phases_per_epoch: 1
+  num_epochs: 30
+
+  # Early stopping — configurable metric; kicks in after early_stop_start_epoch
+  early_stop_patience: 5          # stop if no improvement for this many consecutive epochs
+  early_stop_start_epoch: 5       # start monitoring from epoch 5 (short warmup window)
+  early_stop_metric: "Loss/total/val"     # metric to monitor; Loss/* minimised, others maximised
+  early_stop_min_delta: 1.0e-3    # ignore val-loss drops smaller than this; 1e-3, but 5e-3 was calibrated from dataset sweep sim
+
+  # Checkpoint storage — skip the first N epochs to save disk space
+  checkpoint_save_start_epoch: 1  # numbered checkpoints saved only after this epoch
+
+  # LoRA hyperparameters — rank 16 with alpha=2xrank (SOURCE_1 §H4.7); Optuna best
+  lora_rank: 16
+  lora_alpha: 32.0             # scaling = alpha / rank = 2.0
+
+  # Train/val/test split — tile-level, reproducible, ID regions only.
+  # val gets the remainder: 1 - train_fraction - test_fraction (= 0.25 here).
+  train_fraction: 0.5          # 50% of tiles for train
+  test_fraction: 0.25          # 25% of tiles held out as in-distribution test
+  split_seed: 42               # fixed seed for deterministic tile shuffle
+
+  # Data scarcity study — limit training to first N tiles from the shuffled train pool.
+  # -1 = no limit (use all training tiles). Override per-job: scratch.max_tiles=5
+  max_tiles: -1
+
+  # Optimiser HPs — surfaced as scratch vars so HP sweep can override via CLI
+  weight_decay: 0.0035071886076701955  # Optuna best
+
+  # Data paths
+  tiles_root: /home/ced/Documents/master_thesis/workingdir/code/output_data/tiles
+  masks_root: /home/ced/Documents/master_thesis/workingdir/code/output_data/ground_truth_npz
+  png_cache_dir: /home/ced/Documents/master_thesis/workingdir/code/output_data/favela_png
+  train_regions:
+    - ceu_paz
+    - cantidio_sampaio
+
+# Augmentation pipeline for drone nadir rooftop imagery.
+# Rotation-invariant (90° multiples are realistic for nadir view).
+# Reduced colour jitter compared to MOSE (drone sensors are stable).
+vos:
+  train_transforms:
+    - _target_: training.dataset.transforms.ComposeAPI
+      transforms:
+        - _target_: training.dataset.transforms.RandomHorizontalFlip
+          consistent_transform: True
+        - _target_: training.dataset.transforms.RandomAffine
+          degrees: 45          # 90° caused too many zero-area masks rotating out of frame
+          shear: 5
+          image_interpolation: bilinear
+          consistent_transform: True
+        - _target_: training.dataset.transforms.RandomResizeAPI
+          sizes: ${scratch.resolution}
+          square: true
+          consistent_transform: True
+        - _target_: training.dataset.transforms.ColorJitter
+          consistent_transform: True
+          brightness: 0.15
+          contrast: 0.1
+          saturation: 0.1
+          hue: null
+        - _target_: training.dataset.transforms.ToTensorAPI
+        - _target_: training.dataset.transforms.NormalizeAPI
+          # Dataset-specific stats computed from 597 training tiles (ceu_paz + cantidio_sampaio)
+          # via scripts/prepare_favela_data.py --compute_stats
+          mean: [0.5642, 0.5737, 0.5248]
+          std: [0.3336, 0.3153, 0.3347]
+
+  val_transforms:
+    - _target_: training.dataset.transforms.ComposeAPI
+      transforms:
+        - _target_: training.dataset.transforms.RandomResizeAPI
+          sizes: ${scratch.resolution}
+          square: true
+          consistent_transform: True
+        - _target_: training.dataset.transforms.ToTensorAPI
+        - _target_: training.dataset.transforms.NormalizeAPI
+          mean: [0.5642, 0.5737, 0.5248]
+          std: [0.3336, 0.3153, 0.3347]
+
+trainer:
+  _target_: training.trainer.Trainer
+  mode: train             # was train_only; train enables val loop after each checkpoint epoch
+  max_epochs: ${times:${scratch.num_epochs},${scratch.phases_per_epoch}}
+  accelerator: cuda
+  seed_value: 42
+  early_stop_patience: ${scratch.early_stop_patience}
+  early_stop_start_epoch: ${scratch.early_stop_start_epoch}
+  early_stop_metric: ${scratch.early_stop_metric}
+  early_stop_min_delta: ${scratch.early_stop_min_delta}
+
+  model:
+    _target_: training.model.sam2_lora.SAM2TrainLoRA
+    # LoRA configuration — Attn + MLP, rank=16, alpha=32 (scaling=2.0 per SOURCE_1 §H4.7)
+    lora_rank: ${scratch.lora_rank}
+    lora_alpha: ${scratch.lora_alpha}
+    lora_target_hiera: true
+    lora_target_mask_decoder: true
+    lora_target_hiera_mlp: true         # FFN up/down-proj in all Hiera blocks
+    lora_target_mask_decoder_mlp: true  # FFN in TwoWayAttentionBlocks
+
+    image_encoder:
+      _target_: sam2.modeling.backbones.image_encoder.ImageEncoder
+      scalp: 1
+      trunk:
+        _target_: sam2.modeling.backbones.hieradet.Hiera
+        # b+ architecture (default). Patched at runtime for t / s / l via --model-size.
+        embed_dim: 112
+        num_heads: 2
+        stages: [2, 3, 16, 3]                  # 24 blocks; l=[2,6,36,4] t=[1,2,7,2] s=[1,2,11,2]
+        global_att_blocks: [12, 16, 20]         # l=[23,33,43]  t=[5,7,9]  s=[7,10,13]
+        window_pos_embed_bkg_spatial_size: [14, 14]  # b+ default; t/s/l use [7,7]
+        window_spec: [8, 4, 14, 7]              # l=[8,4,16,8]; t and s share this default
+        drop_path_rate: 0.1
+      neck:
+        _target_: sam2.modeling.backbones.image_encoder.FpnNeck
+        position_encoding:
+          _target_: sam2.modeling.position_encoding.PositionEmbeddingSine
+          num_pos_feats: 256
+          normalize: true
+          scale: null
+          temperature: 10000
+        d_model: 256
+        backbone_channel_list: [896, 448, 224, 112]  # l=[1152,576,288,144] t/s=[768,384,192,96]
+        fpn_top_down_levels: [2, 3]
+        fpn_interp_model: nearest
+
+    memory_attention:
+      _target_: sam2.modeling.memory_attention.MemoryAttention
+      d_model: 256
+      pos_enc_at_input: true
+      layer:
+        _target_: sam2.modeling.memory_attention.MemoryAttentionLayer
+        activation: relu
+        dim_feedforward: 2048
+        dropout: 0.1
+        pos_enc_at_attn: false
+        self_attention:
+          _target_: sam2.modeling.sam.transformer.RoPEAttention
+          rope_theta: 10000.0
+          feat_sizes: [64, 64]
+          embedding_dim: 256
+          num_heads: 1
+          downsample_rate: 1
+          dropout: 0.1
+        d_model: 256
+        pos_enc_at_cross_attn_keys: true
+        pos_enc_at_cross_attn_queries: false
+        cross_attention:
+          _target_: sam2.modeling.sam.transformer.RoPEAttention
+          rope_theta: 10000.0
+          feat_sizes: [64, 64]
+          rope_k_repeat: True
+          embedding_dim: 256
+          num_heads: 1
+          downsample_rate: 1
+          dropout: 0.1
+          kv_in_dim: 64
+      num_layers: 4
+
+    memory_encoder:
+      _target_: sam2.modeling.memory_encoder.MemoryEncoder
+      out_dim: 64
+      position_encoding:
+        _target_: sam2.modeling.position_encoding.PositionEmbeddingSine
+        num_pos_feats: 64
+        normalize: true
+        scale: null
+        temperature: 10000
+      mask_downsampler:
+        _target_: sam2.modeling.memory_encoder.MaskDownSampler
+        kernel_size: 3
+        stride: 2
+        padding: 1
+      fuser:
+        _target_: sam2.modeling.memory_encoder.Fuser
+        layer:
+          _target_: sam2.modeling.memory_encoder.CXBlock
+          dim: 256
+          kernel_size: 7
+          padding: 3
+          layer_scale_init_value: 1e-6
+          use_dwconv: True
+        num_layers: 2
+
+    num_maskmem: 7
+    image_size: ${scratch.resolution}
+    sigmoid_scale_for_mem_enc: 20.0
+    sigmoid_bias_for_mem_enc: -10.0
+    use_mask_input_as_output_without_sam: true
+    directly_add_no_mem_embed: true
+    no_obj_embed_spatial: true
+    use_high_res_features_in_sam: true
+    multimask_output_in_sam: true
+    iou_prediction_use_sigmoid: True
+    use_obj_ptrs_in_encoder: true
+    add_tpos_enc_to_obj_ptrs: true
+    proj_tpos_enc_in_obj_ptrs: true
+    use_signed_tpos_enc_to_obj_ptrs: true
+    only_obj_ptrs_in_the_past_for_eval: true
+    pred_obj_scores: true
+    pred_obj_scores_mlp: true
+    fixed_no_obj_ptr: true
+    multimask_output_for_tracking: true
+    use_multimask_token_for_obj_ptr: true
+    multimask_min_pt_num: 0
+    multimask_max_pt_num: 1
+    use_mlp_for_obj_ptr_proj: true
+
+    # Training-time prompt configuration
+    # Static images: point input only (SAM2Train enforces this for num_frames==1)
+    prob_to_use_pt_input_for_train: 1.0
+    prob_to_use_pt_input_for_eval: 0.0
+    prob_to_use_box_input_for_train: 0.3   # 30% box prompts during training
+    prob_to_use_box_input_for_eval: 0.0
+    prob_to_sample_from_gt_for_train: 0.3  # was 0.1; more GT clicks reduce noisy early-training signal
+    num_frames_to_correct_for_train: 1
+    num_frames_to_correct_for_eval: 1
+    rand_frames_to_correct_for_train: False
+    add_all_frames_to_correct_as_cond: False
+    num_init_cond_frames_for_train: 1
+    rand_init_cond_frames_for_train: False
+    num_correction_pt_per_frame: 6         # was 3; richer boundary-refining supervision for irregular rooftops
+    use_act_ckpt_iterative_pt_sampling: false
+    num_init_cond_frames_for_eval: 1
+    forward_backbone_per_frame_for_eval: False
+
+  data:
+    train:
+      _target_: training.dataset.sam2_datasets.TorchTrainMixedDataset
+      phases_per_epoch: ${scratch.phases_per_epoch}
+      batch_sizes:
+        - ${scratch.train_batch_size}
+      datasets:
+        - _target_: training.dataset.utils.RepeatFactorWrapper
+          dataset:
+            _target_: training.dataset.favela_dataset.FavelaDataset
+            tiles_root: ${scratch.tiles_root}
+            masks_root: ${scratch.masks_root}
+            png_cache_dir: ${scratch.png_cache_dir}
+            regions: ${scratch.train_regions}
+            transforms: ${vos.train_transforms}
+            training: true
+            filter_artifacts: true
+            filter_cut: false
+            multiplier: 1
+            split: "train"                        # 50% of tiles (tile-level split)
+            train_fraction: ${scratch.train_fraction}
+            test_fraction: ${scratch.test_fraction}
+            split_seed: ${scratch.split_seed}
+            max_tiles: ${scratch.max_tiles}       # -1 = all tiles; >0 for data scarcity
+      shuffle: True
+      num_workers: ${scratch.num_train_workers}
+      pin_memory: False  # page-locked memory can rapidly consume all available system RAM -> OOM
+      drop_last: True
+      collate_fn:
+        _target_: training.utils.data_utils.collate_fn
+        _partial_: true
+        dict_key: all
+
+    val:
+      _target_: training.dataset.sam2_datasets.TorchTrainMixedDataset
+      phases_per_epoch: 1
+      batch_sizes:
+        - ${scratch.train_batch_size}
+      datasets:
+        - _target_: training.dataset.utils.RepeatFactorWrapper
+          dataset:
+            _target_: training.dataset.favela_dataset.FavelaDataset
+            tiles_root: ${scratch.tiles_root}
+            masks_root: ${scratch.masks_root}
+            png_cache_dir: ${scratch.png_cache_dir}
+            regions: ${scratch.train_regions}
+            transforms: ${vos.val_transforms}
+            training: false
+            filter_artifacts: true
+            filter_cut: false
+            multiplier: 1
+            split: "val"                          # 25% of tiles held out
+            train_fraction: ${scratch.train_fraction}
+            test_fraction: ${scratch.test_fraction}
+            split_seed: ${scratch.split_seed}
+      shuffle: False
+      num_workers: ${scratch.num_train_workers}
+      pin_memory: False  # page-locked memory can rapidly consume all available system RAM -> OOM
+      drop_last: False
+      collate_fn:
+        _target_: training.utils.data_utils.collate_fn
+        _partial_: true
+        dict_key: all
+
+  optim:
+    amp:
+      enabled: True
+      amp_dtype: bfloat16
+
+    optimizer:
+      _target_: torch.optim.AdamW
+
+    gradient_clip:
+      _target_: training.optimizer.GradientClipper
+      max_norm: 0.5
+      norm_type: 2
+
+    # No layer-decay for LoRA (all trainable params are LoRA A/B matrices)
+    param_group_modifiers: []
+
+    options:
+      lr:
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.CompositeParamScheduler
+            schedulers:
+              - _target_: fvcore.common.param_scheduler.LinearParamScheduler
+                start_value: 0.0
+                end_value: ${scratch.base_lr}
+              - _target_: fvcore.common.param_scheduler.CosineParamScheduler
+                start_value: ${scratch.base_lr}
+                end_value: ${divide:${scratch.base_lr},20}
+            lengths: [0.1, 0.9]                # 10% warmup, 90% cosine decay
+            interval_scaling: [rescaled, rescaled]
+      weight_decay:
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+            value: ${scratch.weight_decay}
+
+  loss:
+    all:
+      _target_: training.loss_fns_favela.FavelaCompositeLoss
+      weight_dict:
+        loss_class: 1.0     # object-presence classification loss (kept for completeness)
+      weight_bce: 0.0       # 0.0 = off; guarded in loss fn so no compute wasted
+      weight_tversky: 1.0
+      weight_iou: 1.0
+      tversky_alpha: 0.3    # FP penalty (low → tolerate false positives)
+      tversky_beta: 0.5513642989345549  # Optuna best
+      tversky_gamma: 0.75   # focal exponent
+      dice_eps: 1.0e-5
+      supervise_all_iou: true
+      iou_use_l1_loss: true
+      pred_obj_scores: true
+      focal_gamma_obj_score: 0.0
+      focal_alpha_obj_score: -1.0
+
+  distributed:
+    backend: nccl
+    find_unused_parameters: False
+
+  logging:
+    tensorboard_writer:
+      _target_: training.utils.logger.make_tensorboard_logger
+      log_dir: ${launcher.experiment_log_dir}/tensorboard
+      flush_secs: 60
+      should_log: True
+    log_dir: ${launcher.experiment_log_dir}/logs
+    log_freq: 5
+
+  checkpoint:
+    save_dir: ${launcher.experiment_log_dir}/checkpoints
+    save_freq: 1              # save every epoch (storage gated by save_start_epoch)
+    save_start_epoch: ${scratch.checkpoint_save_start_epoch}
+    model_weight_initializer:
+      _partial_: True
+      _target_: training.utils.checkpoint_utils.load_state_dict_into_model
+      strict: False
+      # LoRA A/B matrices are new and not in the SAM2.1 checkpoint → ignore
+      ignore_missing_keys:
+        - "*lora_A*"
+        - "*lora_B*"
+      ignore_unexpected_keys: null
+      state_dict:
+        _target_: training.utils.checkpoint_utils.load_checkpoint_and_apply_kernels
+        checkpoint_path: ./checkpoints/sam2.1_hiera_large.pt  # patched by --model-size
+        ckpt_state_dict_keys: ["model"]
+
+launcher:
+  num_nodes: 1
+  gpus_per_node: 1
+  experiment_log_dir: ./sam2_logs/favela_lora
+
+submitit:
+  partition: null
+  account: null
+  qos: null
+  cpus_per_task: 4
+  use_cluster: false
+  timeout_hour: 48
+  name: favela_lora
+  port_range: [10000, 65000]
