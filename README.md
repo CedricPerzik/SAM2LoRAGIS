@@ -1,3 +1,8 @@
+# Dataset
+
+The annotated file for labels in QGIS can be found here, along with the geoTIFF:
+['CEU Paz on Huggingface](https://huggingface.co/datasets/CedricTheFirst/CEU_PAZ)
+
 # SAM2LoRaBoRaDD — SLURM Pipeline
 
 LoRA fine-tuning of SAM2.1-Large for favela rooftop segmentation, run as a
