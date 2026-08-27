@@ -27,6 +27,138 @@ ssh s1234567@hpc-head1.ewi.utwente.nl
 | IoU results (CSV) | `/home/s1234567/thesis/data/iou_results/<RUN_ID>/n<N>/n<N>_<area>_unified_metrics.csv` |
 | Conda env | `sam2lora` |
 
+## Conda environment setup (one-time, before anything else)
+
+Done once per cluster account, before the first `download_ckpts.sh` /
+`pip install -e .` step below. Skip if `sam2lora` already exists (check with
+`conda env list`).
+
+### 1. Create the environment
+
+```bash
+ssh s1234567@hpc-head1.ewi.utwente.nl
+
+module load anaconda3/2024.02
+
+conda create -n sam2lora python=3.11 -y
+
+conda init
+# close the shell and reopen it so conda init takes effect
+
+conda activate sam2lora
+```
+
+### 2. Install packages into it
+
+```bash
+conda activate sam2lora
+
+# PyTorch 2.5.1 + CUDA 11.8
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+
+# Project dependencies
+pip install hydra-core iopath Pillow fvcore tensorboard tensordict submitit
+
+# Hyperparameter sweep
+conda install -c conda-forge optuna
+# pip install optuna also works if the conda-forge build gives trouble --
+# not confirmed necessary on top of the conda-forge install above.
+
+conda install -c conda-forge opencv
+
+conda install -c conda-forge pycocotools pandas
+
+# For tensorboard
+conda install -c conda-forge setuptools protobuf grpcio werkzeug
+```
+
+After this, continue with initialising sam2 below.
+
+## Building & initializing the sam2 repo (not included in this repo)
+
+`sam2loraboracluster/sam2/` is **not tracked in this GitHub repository.** It's
+a full clone of Meta's [`facebookresearch/sam2`](https://github.com/facebookresearch/sam2)
+with this project. it's rebuilt fresh on device, pushed to
+the cluster, and re-initialised there. 
+so: 1. clone sam2 repo into directory. 2. on cluster, run the initialisation code as
+explained in: [`Install instructions for SAM2 in root of sam2 repo`](https://github.com/facebookresearch/sam2/blob/main/INSTALL.md)
+
+
+Modified upstream files:
+
+| File | What changed |
+|---|---|
+| `checkpoints/download_ckpts.sh` | minor tweaks for this project's layout |
+| `sam2/automatic_mask_generator.py` | used as-is by `B3_custom_predict_cluster.py` |
+| `sav_dataset/example/sav_000001_manual.json` | unrelated fixture change |
+| `training/dataset/sam2_datasets.py` | wiring for `FavelaDataset` |
+| `training/dataset/transforms.py` | favela augmentation support |
+| `training/dataset/vos_segment_loader.py` | favela-compatible segment loading |
+| `training/train.py` | scarcity-sweep CLI flags (`--max-tiles`, `--split-seed`, `--trainer-seed`, `--test-split-dir`, LoRA/loss/early-stop flags — see "Where to change values") |
+| `training/trainer.py` | LoRA-aware trainer, early stopping, the `_LOSS_KEY_MAP` fix (see CLAUDE.md) |
+| `training/utils/logger.py` | ASCII-safe logging (SLURM nodes run a latin-1 locale) |
+
+Deleted (safe to remove — superseded by `sam2/configs/sam2/*.yaml`, not
+required for anything in this pipeline):
+`sam2/sam2_hiera_b+.yaml`, `sam2/sam2_hiera_l.yaml`, `sam2/sam2_hiera_s.yaml`,
+`sam2/sam2_hiera_t.yaml`.
+
+New files/directories added by this project:
+
+| Path | Purpose |
+|---|---|
+| `sam2/configs/sam2.1_training/sam2.1_hiera_favela_lora.yaml` | The training config — see "Where to change values" above. |
+| `sam2/modeling/lora.py` | LoRA layer implementation (A/B low-rank matrices). |
+| `training/model/sam2_lora.py` | `SAM2TrainLoRA` — injects LoRA into Hiera + mask decoder, freezes base weights. |
+| `training/dataset/favela_dataset.py` | `FavelaDataset` — PNG-cache-mode loader, tile-level train/val/test split, `max_tiles` scarcity cap. |
+| `training/dataset/split_utils.py` | Shared `compute_split()` / `dump_test_manifest()`, used by both `FavelaDataset` and `train.py`. |
+| `training/loss_fns_favela.py` | `FavelaCompositeLoss` (Tversky + IoU + class loss). |
+| `hp_sweep.py` | Optuna objective function driving `submit_hp_sweep.sh` / `hp_trial.sh`. |
+| `custom_notebooks/` | `B3_custom_predict_cluster.py`, `B_functions.py`, `D2_dataset_iou_cluster.py`, `D_functions.py` — the inference and IoU-evaluation entry points used by steps 3-4 of the pipeline below. Must exist here before their first SLURM run. |
+
+### Install and fetch pretrained weights
+
+```bash
+cd /home/s1234567/thesis/sam2loraboracluster/sam2
+pip install -e .
+cd checkpoints && bash download_ckpts.sh
+```
+
+`download_ckpts.sh` downloads the four pretrained SAM2.1 checkpoints directly
+from Meta — they're never stored in this repo either.
+
+### Data transfer (local -> cluster, EduVPN active)
+
+```bash
+# Code (includes the full modified sam2loraboracluster/sam2/ tree)
+rsync -avz --exclude '__pycache__' --exclude '*.pyc' --exclude 'sam2_logs/' \
+  /path/to/local/sam2loraboracluster/ \
+  s1234567@hpc-head1.ewi.utwente.nl:/home/s1234567/thesis/sam2loraboracluster/
+
+# PNG cache (primary data source, ~few GB)
+rsync -avz \
+  /path/to/local/output_data/favela_png/ \
+  s1234567@hpc-head1.ewi.utwente.nl:/home/s1234567/thesis/data/favela_png/
+```
+
+`--exclude 'sam2_logs/'` keeps this from re-uploading every training run's
+checkpoints on each sync — `sam2_logs/` is populated on the cluster by
+`train_cluster.sh`, not pushed to it.
+
+### If you want sam2/ under version control instead of rebuilding it each time
+
+Either of these works and avoids ever needing the full 78 GB in git:
+
+- **Submodule** — `git submodule add https://github.com/facebookresearch/sam2.git sam2loraboracluster/sam2`,
+  pin it to `2b90b9f`, and commit the modified/new files listed above as a
+  patch on top. Keeps the outer repo small while still recording exactly
+  which upstream commit + local changes are in use.
+- **Vendor selectively** — add a `.gitignore` inside `sam2loraboracluster/sam2/`
+  excluding `checkpoints/*.pt` and `sam2_logs/`, then delete the nested `.git`
+  (`rm -rf sam2loraboracluster/sam2/.git`) so the outer repo can track the
+  rest of the tree as plain files. Watch for `sam2_logs/**/checkpoints/*.pt`
+  still slipping in if that ignore rule is missed — that's most of the 78 GB.
+
 ## Where to change values
 
 Two layers control every run:
@@ -252,8 +384,8 @@ deleted; running jobs are skipped entirely. No settings beyond `--dry`.
 
 ### 6. `rerun_jobs.sh` (optional)
 
-Re-submits failed training jobs recorded in `logs/seeds.txt` (one line per
-run, written by `submit_scarcity_sweep.sh`: `RUN_ID SEED`). To re-run
+Re-submits failed training jobs manually added or recorded in `logs/seeds.txt` 
+(one line per run, written by `submit_scarcity_sweep.sh`: `RUN_ID SEED`). To re-run
 specific sizes for a run, append the sizes to its line:
 
 ```
@@ -336,16 +468,8 @@ bash cleanup_hp_checkpoints.sh --dry    # show what would be deleted only
 
 ```bash
 squeue -u s1234567           # running / queued jobs
-seff <jobid>                 # efficiency report after completion
+
 # Web dashboard: http://hpc-status.ewi.utwente.nl/slurm/
-```
-
-TensorBoard (SSH tunnel from local machine):
-
-```bash
-ssh -L 6006:localhost:6006 s1234567@hpc-head1.ewi.utwente.nl
-# on the cluster:
-tensorboard --logdir /home/s1234567/thesis/sam2loraboracluster/sam2/sam2_logs/ --port 6006
 ```
 
 ---
@@ -353,13 +477,13 @@ tensorboard --logdir /home/s1234567/thesis/sam2loraboracluster/sam2/sam2_logs/ -
 ## End-to-end example (5 seeds x 7 sizes, full pipeline)
 
 ```bash
-# 1. One-time setup
+# 1. One-time setup (conda env — see "Conda environment setup" above — then:)
 cd /home/s1234567/thesis/sam2loraboracluster/sam2/checkpoints && bash download_ckpts.sh
 cd /home/s1234567/thesis/sam2loraboracluster/sam2 && pip install -e .
 
 # 2. Train — submits 35 jobs (5 seeds x 7 sizes), creates run_001..run_005
 cd /home/s1234567/thesis
-bash submit_scarcity_sweep.sh --seeds 1 26 42 99 1234
+bash submit_scarcity_sweep.sh --seeds 111 222 333 444 555
 
 # (wait for squeue to clear)
 
@@ -370,6 +494,8 @@ bash submit_inference_sweep.sh --run-ids run_001 run_002 run_003 run_004 run_005
 
 # 4. IoU / metrics CSVs for all 5 runs
 bash submit_iou_sweep.sh --run-ids run_001 run_002 run_003 run_004 run_005
+
+# Transfer all .csv's to local machine for graphing and analysis
 
 # 5. Free checkpoint storage once you have what you need locally
 bash cleanup_dataset_checkpoints.sh
