@@ -1,0 +1,7 @@
+Best trial: #20 (/40)
+  Objective (1 - dice): 0.016096  ->  val_dice: 0.983904
+  Params:
+    base_lr: 7.102526614544882e-05
+    lora_rank: 16
+    tversky_beta: 0.5513642989345549
+    weight_decay: 0.0035071886076701955

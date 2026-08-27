@@ -1,0 +1,61 @@
+input_data/*
+
+# Ignore all TIF tiles within the output dataset folders
+output_data/tiles/*/*.tif
+output_data/tiles_png/*/*.png
+# Ensure metadata JSON files are NOT ignored
+!output_data/tiles/**/metadata/*.json
+
+# results
+output_data/masks/*/*.npz
+output_data/notebook_export/*
+output_data/ground_truth_npz/*/*.npz
+output_data/evaluation_npz/*/*.npz
+output_data/iou_results/*.csv
+output_data/iou_results/*.png
+output_data/debug_visuals/*
+output_data/debug_visuals_safekeep/*
+output_data/graphs/*
+output_data/models/sam2unet/tiles/*/tiles_tif/*.tif
+output_data/models/sam2unet/tiles/*/tiles_png/*.png
+!output_data/models/sam2unet/tiles/*/metadata/*.json
+output_data/models/sam2unet/*/*/*.png
+output_data/models/sam2unet/tiles/*/*.tif
+
+output_data/datasets/*/*.png
+
+# SAM2LoRaBoRaDD
+output_data/favela_png/images/*/*.png
+output_data/favela_png/masks/*/*/*.png
+output_data/favela_png/masks/*/*.json
+output_data/predictions/*/*/*.npz
+output_data/predictions/*/*.png
+
+
+# Ignore Python cache files
+__pycache__
+
+# Ignore system specific jank
+output_data/tiles/**/.DS_Store
+output_data/tiles/**/Thumbs.db
+
+sam_repo/*
+sam_repo/sam2
+output_data/models/sam2unet/split_data/*/*/*/*.png
+output_data/evaluation_npz/*/*/*.npz
+
+output_data/evaluation_npz/*/*/*/*.npz
+output_data/figures/*.png
+output_data/iou_results/*/*/*.csv
+output_data/iou_results/runs/*/*/*.csv
+output_data/predictions/*/*/*/*.npz
+output_data/evaluation_npz/runs/*/*/*/*.npz
+output_data/figures/exp_graphs/*.pdf
+output_data/figures/exp_graphs/*.png
+output_data/tables/perf_scores/*.tex
+output_data/tables/perf_scores/*.csv
+output_data/iou_results/hausdorff_cache/*.csv
+output_data/figures/exp_graphs/safekeep/*.pdf
+output_data/figures/exp_graphs/safekeep/*.png
+output_data/tables/perf_scores_safekeep/*.csv
+output_data/tables/perf_scores_safekeep/*.tex
